@@ -1,0 +1,6 @@
+{
+  "name": "SIET-LMS Offline",
+  "description": "Offline-first Learning Management System and local Gemma 4 educational assistant for Sri Shakthi Institute of Engineering and Technology (SIET).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
