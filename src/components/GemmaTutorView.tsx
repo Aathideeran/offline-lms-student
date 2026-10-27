@@ -7,25 +7,35 @@ import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
   BookOpen,
+  CheckCircle2,
   Cpu,
   FileText,
+  HardDrive,
   Loader2,
+  Play,
   RefreshCw,
   Send,
   Settings2,
   ShieldCheck,
   Trash2,
+  WifiOff,
   X,
 } from 'lucide-react';
 import {
   ChatMessage,
   Course,
   GemmaRuntimeConfig,
+  InferenceVerificationResult,
   LocalDocumentChunk,
   RetrievedCitation,
   RuntimeProbeResult,
 } from '../types/lms';
-import { DEFAULT_GEMMA_CONFIG, gemma4Adapter } from '../services/gemmaAdapter';
+import {
+  gemma4Adapter,
+  getBrowserOriginContext,
+  loadSavedGemmaConfig,
+  saveGemmaConfig,
+} from '../services/gemmaAdapter';
 import {
   buildGroundedTutorPrompt,
   retrieveRelevantChunks,
@@ -56,29 +66,98 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [showConfigDrawer, setShowConfigDrawer] = useState(false);
-  const [runtimeConfig, setRuntimeConfig] = useState<GemmaRuntimeConfig>(DEFAULT_GEMMA_CONFIG);
-  const [probeStatus, setProbeStatus] = useState<RuntimeProbeResult>(() => ({
-    reachable: false,
-    modelInstalled: false,
-    availableModels: [],
-    backendId: DEFAULT_GEMMA_CONFIG.backendId,
-    endpointUrl: DEFAULT_GEMMA_CONFIG.endpointUrl,
-    modelTag: DEFAULT_GEMMA_CONFIG.modelTag,
-    latencyMs: null,
-    statusMessage: `Local Gemma runtime (${DEFAULT_GEMMA_CONFIG.modelTag} @ ${DEFAULT_GEMMA_CONFIG.endpointUrl}) has not been connected yet in this session. Operating in verified local RAG document evidence mode (no cloud AI calls). Start Ollama or llama.cpp locally and click "Verify Local Runtime" to connect.`,
-    checkedAt: new Date().toISOString(),
-  }));
+  const [runtimeConfig, setRuntimeConfig] = useState<GemmaRuntimeConfig>(() =>
+    loadSavedGemmaConfig()
+  );
+
+  const [probeStatus, setProbeStatus] = useState<RuntimeProbeResult>(() => {
+    const initialCfg = loadSavedGemmaConfig();
+    const originCtx = getBrowserOriginContext(initialCfg.endpointUrl);
+    return {
+      reachable: false,
+      modelInstalled: false,
+      availableModels: [],
+      backendId: initialCfg.backendId,
+      endpointUrl: initialCfg.endpointUrl,
+      modelTag: initialCfg.modelTag,
+      latencyMs: null,
+      failureReason: 'unprobed',
+      executionOrigin: originCtx.executionOrigin,
+      isHttpsCloudPreview: originCtx.isHttpsCloudPreview,
+      statusMessage: originCtx.isHttpsCloudPreview
+        ? `Running in remote HTTPS preview (${originCtx.executionOrigin}). Here ${initialCfg.endpointUrl} refers to your local computer's loopback interface. Click "Check Runtime & Models" or "Test Model Inference" to probe your local Ollama/llama.cpp server, or open "Adapter & Setup Guide" for local deployment instructions.`
+        : `Local Gemma runtime (${initialCfg.modelTag} @ ${initialCfg.endpointUrl}) has not been verified in this session yet. Click "Check Runtime & Models" or "Test Model Inference" to verify live model availability.`,
+      checkedAt: new Date().toISOString(),
+    };
+  });
+
+  const [inferenceVerification, setInferenceVerification] =
+    useState<InferenceVerificationResult | null>(null);
   const [isProbing, setIsProbing] = useState(false);
+  const [isTestingInference, setIsTestingInference] = useState(false);
+  const [pwaCacheStatus, setPwaCacheStatus] = useState<{
+    swSupported: boolean;
+    swControlled: boolean;
+    cacheNamesCount: number;
+  }>({
+    swSupported: false,
+    swControlled: false,
+    cacheNamesCount: 0,
+  });
+
   const [inspectedCitation, setInspectedCitation] = useState<RetrievedCitation | null>(null);
   const [inspectedPromptPreview, setInspectedPromptPreview] = useState<string | null>(null);
 
-  const isModelReady = Boolean(probeStatus?.reachable && probeStatus?.modelInstalled !== false);
+  const isModelReady = Boolean(probeStatus?.reachable && probeStatus?.modelInstalled === true);
+  const isInferenceVerified = Boolean(inferenceVerification?.verified);
+
+  useEffect(() => {
+    let mounted = true;
+    async function checkPwaState() {
+      const swSupported = typeof navigator !== 'undefined' && 'serviceWorker' in navigator;
+      const swControlled = swSupported && Boolean(navigator.serviceWorker.controller);
+      let cacheNamesCount = 0;
+      try {
+        if (typeof window !== 'undefined' && 'caches' in window) {
+          const keys = await window.caches.keys();
+          cacheNamesCount = keys.length;
+        }
+      } catch {
+        cacheNamesCount = 0;
+      }
+      if (mounted) {
+        setPwaCacheStatus({ swSupported, swControlled, cacheNamesCount });
+      }
+    }
+    checkPwaState();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const updateConfig = (next: GemmaRuntimeConfig) => {
+    setRuntimeConfig(next);
+    saveGemmaConfig(next);
+    setInferenceVerification(null);
+  };
 
   const runProbe = async (cfg: GemmaRuntimeConfig) => {
     setIsProbing(true);
+    setErrorBanner(null);
     const result = await gemma4Adapter.probeRuntime(cfg);
     setProbeStatus(result);
     setIsProbing(false);
+    return result;
+  };
+
+  const runInferenceVerification = async (cfg: GemmaRuntimeConfig) => {
+    setIsTestingInference(true);
+    setErrorBanner(null);
+    const probeRes = await gemma4Adapter.probeRuntime(cfg);
+    setProbeStatus(probeRes);
+    const verifyRes = await gemma4Adapter.verifyActualInference(cfg);
+    setInferenceVerification(verifyRes);
+    setIsTestingInference(false);
   };
 
   useEffect(() => {
@@ -120,11 +199,14 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
       topK: 3,
     });
 
+    const shouldSkipNetwork =
+      probeStatus.failureReason === 'unprobed' || !isModelReady;
+
     const response = await gemma4Adapter.generateGroundedResponse({
       query: trimmed,
       citations,
       config: runtimeConfig,
-      skipRuntimeCallIfUnverified: !isModelReady,
+      skipRuntimeCallIfUnverified: shouldSkipNetwork,
     });
 
     if (response.runtimeError) {
@@ -171,7 +253,7 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
 
   return (
     <main className="w-full max-w-[960px] mx-auto px-4 sm:px-6 py-7">
-      {/* Header & Local Runtime Status Bar */}
+      {/* Header & Local Runtime Verification Panel */}
       <div className="bg-white border border-[#dee2e6] rounded-[12px] p-5 mb-5">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
@@ -192,20 +274,36 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
             <button
               type="button"
               onClick={() => runProbe(runtimeConfig)}
-              disabled={isProbing}
+              disabled={isProbing || isTestingInference}
               className="px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isProbing ? 'animate-spin' : ''}`} />
-              <span>Verify Local Runtime</span>
+              <span>Check Runtime &amp; Models</span>
             </button>
+
+            <button
+              type="button"
+              onClick={() => runInferenceVerification(runtimeConfig)}
+              disabled={isTestingInference || isProbing}
+              className="px-3 py-1.5 rounded-lg bg-[#015303] hover:bg-[#0f6b3e] text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {isTestingInference ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Play className="w-3.5 h-3.5" />
+              )}
+              <span>{isTestingInference ? 'Testing Model...' : 'Test Model Inference'}</span>
+            </button>
+
             <button
               type="button"
               onClick={() => setShowConfigDrawer((prev) => !prev)}
               className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-medium text-slate-800 flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
             >
               <Settings2 className="w-3.5 h-3.5" />
-              <span>Adapter & Setup Guide</span>
+              <span>Adapter &amp; Setup Guide</span>
             </button>
+
             <button
               type="button"
               onClick={async () => {
@@ -223,35 +321,171 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
           </div>
         </div>
 
-        {/* Local Model Status Indicator */}
+        {/* 3-Layer Offline & Runtime Capability Matrix */}
+        <div
+          aria-label="Offline and Runtime Capability Matrix"
+          className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4 text-xs"
+        >
+          <div className="p-3 rounded-lg bg-slate-50 border border-slate-200">
+            <div className="flex items-center gap-1.5 font-semibold text-slate-800">
+              <WifiOff className="w-3.5 h-3.5 text-[#0f6b3e]" />
+              <span>1. App Shell Offline Cache</span>
+            </div>
+            <div className="mt-1 font-mono text-[11px] text-slate-700">
+              {pwaCacheStatus.swSupported
+                ? `Service Worker: Supported (${pwaCacheStatus.cacheNamesCount} cache store${pwaCacheStatus.cacheNamesCount === 1 ? '' : 's'})`
+                : 'Service Worker: Unavailable in this browser'}
+            </div>
+            <div className="text-[11px] text-slate-500 mt-0.5">
+              Caches UI assets only (does not bundle LLM weights)
+            </div>
+          </div>
+
+          <div className="p-3 rounded-lg bg-emerald-50/60 border border-emerald-200">
+            <div className="flex items-center gap-1.5 font-semibold text-emerald-950">
+              <HardDrive className="w-3.5 h-3.5 text-[#0f6b3e]" />
+              <span>2. Local Document Search</span>
+            </div>
+            <div className="mt-1 font-mono tabular-nums text-[11px] text-emerald-900 font-semibold">
+              ● Verified Active ({chunks.length} Indexed Chunks)
+            </div>
+            <div className="text-[11px] text-slate-600 mt-0.5">
+              100% Local IndexedDB BM25 retrieval (Works Offline)
+            </div>
+          </div>
+
+          <div
+            className={`p-3 rounded-lg border ${
+              isInferenceVerified
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                : 'bg-amber-50/70 border-amber-200 text-slate-800'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 font-semibold">
+              <Cpu className="w-3.5 h-3.5 text-[#015303]" />
+              <span>3. Local Gemma Inference</span>
+            </div>
+            <div className="mt-1 font-mono text-[11px] font-semibold">
+              {isInferenceVerified
+                ? `● Verified Live (${inferenceVerification?.modelTag} · ${inferenceVerification?.latencyMs} ms)`
+                : isModelReady
+                ? `◐ API Reachable (${runtimeConfig.modelTag}) — Click "Test Model Inference"`
+                : `▲ Unavailable (${runtimeConfig.endpointUrl})`}
+            </div>
+            <div className="text-[11px] text-slate-600 mt-0.5">
+              {isInferenceVerified
+                ? 'Real completion verified from local runtime'
+                : 'Requires local Ollama / llama.cpp process on host'}
+            </div>
+          </div>
+        </div>
+
+        {/* Detailed Local Model Status Indicator */}
         {probeStatus && (
           <div
             role="status"
             aria-label="Local Model Status Indicator"
-            className={`mt-4 p-3 rounded-lg border text-xs leading-relaxed ${
+            className={`mt-3 p-3 rounded-lg border text-xs leading-relaxed ${
               isModelReady
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
                 : 'bg-amber-50/80 border-amber-200 text-slate-800'
             }`}
           >
-            <div className="font-semibold flex items-center justify-between gap-2">
+            <div className="font-semibold flex flex-wrap items-center justify-between gap-2">
               <span>
-                {isModelReady
-                  ? `● Local Gemma Model Available (${probeStatus.modelTag} @ ${probeStatus.endpointUrl})`
+                {isInferenceVerified
+                  ? `● Real Local Gemma Inference Verified (${runtimeConfig.modelTag} @ ${runtimeConfig.endpointUrl})`
+                  : isModelReady
+                  ? `● Local Gemma Model Installed (${probeStatus.modelTag} @ ${probeStatus.endpointUrl}) — Ready for Inference Verification`
                   : probeStatus.reachable && probeStatus.modelInstalled === false
-                  ? `▲ Local Runtime Reachable — Model "${probeStatus.modelTag}" Missing at ${probeStatus.endpointUrl}`
-                  : `▲ Local Gemma Model Unavailable (${probeStatus.endpointUrl}) — Using Verified Local Document Evidence`}
+                  ? `▲ Local Runtime Reachable at ${probeStatus.endpointUrl} — Model "${probeStatus.modelTag}" Not Installed`
+                  : `▲ Local Gemma Model Unavailable (${probeStatus.endpointUrl}) — Using Verified Local Document Evidence Mode`}
               </span>
-              <span className="font-mono text-[11px] text-slate-500 shrink-0">
+              <span className="font-mono text-[11px] text-slate-600 shrink-0">
                 <ShieldCheck className="w-3.5 h-3.5 inline mr-1 text-[#0f6b3e]" />
-                100% Local · No Cloud Fallback
+                No Cloud AI Fallback
               </span>
             </div>
-            <p className="mt-0.5 text-slate-600">{probeStatus.statusMessage}</p>
+            <p className="mt-1 text-slate-700">{probeStatus.statusMessage}</p>
+
+            {probeStatus.reachable &&
+              probeStatus.availableModels &&
+              probeStatus.availableModels.length > 0 &&
+              !probeStatus.modelInstalled && (
+                <div className="mt-2.5 pt-2 border-t border-amber-200/80 flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-semibold text-slate-800">
+                    Switch to an installed local model:
+                  </span>
+                  {probeStatus.availableModels.map((installedName) => (
+                    <button
+                      key={installedName}
+                      type="button"
+                      onClick={() => {
+                        const next = { ...runtimeConfig, modelTag: installedName };
+                        updateConfig(next);
+                        runProbe(next);
+                      }}
+                      className="px-2.5 py-1 rounded bg-white border border-[#0f6b3e] text-[#0f6b3e] hover:bg-emerald-50 font-mono text-[11px] font-semibold cursor-pointer"
+                    >
+                      Use {installedName}
+                    </button>
+                  ))}
+                </div>
+              )}
           </div>
         )}
 
-        {/* Windows / Android Native Runtime Adapter Configuration Drawer */}
+        {/* Live Model Inference Verification Result Panel */}
+        {inferenceVerification && (
+          <div
+            role="region"
+            aria-label="Model Inference Verification Result"
+            className={`mt-3 p-3.5 rounded-lg border text-xs space-y-1.5 ${
+              inferenceVerification.verified
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                : 'bg-red-50 border-red-200 text-red-950'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="font-bold flex items-center gap-1.5">
+                {inferenceVerification.verified ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-red-700 shrink-0" />
+                )}
+                <span>
+                  {inferenceVerification.verified
+                    ? `Live Inference Verified (${inferenceVerification.modelTag} responded in ${inferenceVerification.latencyMs} ms)`
+                    : `Live Inference Verification Failed (${inferenceVerification.endpointUrl})`}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setInferenceVerification(null)}
+                aria-label="Close inference test result"
+                className="p-1 rounded hover:bg-black/5 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="font-mono text-[11px]">
+              Test Prompt Sent: &ldquo;{inferenceVerification.testPrompt}&rdquo;
+            </div>
+
+            {inferenceVerification.verified ? (
+              <div className="p-2 rounded bg-white border border-emerald-200 font-mono text-[11px] text-slate-900">
+                Real Model Response: &ldquo;{inferenceVerification.rawResponseText}&rdquo;
+              </div>
+            ) : (
+              <div className="text-[11.5px] leading-relaxed">
+                <strong>Diagnostic Error:</strong> {inferenceVerification.errorMessage}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Windows / Linux / Android Native Runtime Adapter & Diagnostic Setup Guide */}
         {showConfigDrawer && (
           <div className="mt-4 pt-4 border-t border-slate-200 space-y-4 text-xs">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -271,11 +505,11 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
                       backendId === 'ollama_local'
                         ? 'http://127.0.0.1:11434'
                         : 'http://127.0.0.1:8080';
-                    setRuntimeConfig((prev) => ({
-                      ...prev,
+                    updateConfig({
+                      ...runtimeConfig,
                       backendId,
                       endpointUrl: defaultUrl,
-                    }));
+                    });
                   }}
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white"
                 >
@@ -291,14 +525,14 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
                   htmlFor="gemma-endpoint-input"
                   className="block font-semibold text-slate-700 mb-1"
                 >
-                  Localhost Endpoint URL
+                  Local Endpoint URL
                 </label>
                 <input
                   id="gemma-endpoint-input"
                   type="url"
                   value={runtimeConfig.endpointUrl}
                   onChange={(e) =>
-                    setRuntimeConfig((prev) => ({ ...prev, endpointUrl: e.target.value }))
+                    updateConfig({ ...runtimeConfig, endpointUrl: e.target.value })
                   }
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 font-mono"
                 />
@@ -309,45 +543,64 @@ export const GemmaTutorView: React.FC<GemmaTutorViewProps> = ({
                   htmlFor="gemma-model-input"
                   className="block font-semibold text-slate-700 mb-1"
                 >
-                  Gemma Model Tag
+                  Configured Model Tag
                 </label>
                 <input
                   id="gemma-model-input"
                   type="text"
                   value={runtimeConfig.modelTag}
                   onChange={(e) =>
-                    setRuntimeConfig((prev) => ({ ...prev, modelTag: e.target.value }))
+                    updateConfig({ ...runtimeConfig, modelTag: e.target.value })
                   }
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 font-mono"
                 />
               </div>
             </div>
 
-            <div className="p-3.5 bg-slate-50 rounded-lg border border-slate-200 space-y-2 text-slate-700">
-              <div className="font-semibold text-slate-900">
-                Local Gemma Model Installation & Configuration (User Consent Required):
+            <div className="p-3.5 bg-slate-50 rounded-lg border border-slate-200 space-y-2.5 text-slate-700">
+              <div className="font-bold text-slate-900">
+                Why 127.0.0.1:11434 Shows Unavailable in Cloud Preview &amp; How to Run Locally:
               </div>
-              <p className="text-[11.5px] text-slate-600">
-                SIET-LMS Offline never downloads multi-gigabyte model weights without your explicit
-                action. To enable live generative explanations on your device:
-              </p>
-              <div>
-                <strong>1. Windows PC (Ollama):</strong> Install Ollama, then run{' '}
-                <code className="px-1.5 py-0.5 bg-white border rounded font-mono">
-                  OLLAMA_ORIGINS=* ollama serve
-                </code>{' '}
-                and{' '}
-                <code className="px-1.5 py-0.5 bg-white border rounded font-mono">
-                  ollama pull {runtimeConfig.modelTag}
+              <p className="text-[11.5px] leading-relaxed">
+                <strong>1. Environment Diagnosis:</strong> When viewing the hosted preview URL (
+                <code className="px-1 py-0.5 bg-white border rounded font-mono">
+                  https://*.run.app
                 </code>
-                , then click <strong>Verify Local Runtime</strong>.
-              </div>
-              <div>
-                <strong>2. Android / Windows (llama.cpp or LiteRT Server):</strong> Start{' '}
-                <code className="px-1.5 py-0.5 bg-white border rounded font-mono">
-                  llama-server -m gemma-4-E4B-it-Q4_K_M.gguf --port 8080 --cors
-                </code>{' '}
-                and select <strong>llama.cpp / LiteRT OpenAI Server</strong> above.
+                ), the cloud container itself does not have Ollama or multi-gigabyte Gemma model
+                weights installed, and browsers restrict HTTPS web pages from connecting to
+                unencrypted <code className="px-1 py-0.5 bg-white border rounded font-mono">http://127.0.0.1:11434</code>{' '}
+                unless CORS and Private Network Access are explicitly configured on your machine.
+              </p>
+              <div className="text-[11.5px] space-y-1">
+                <strong>2. Recommended Local Deployment Setup (Windows / Linux):</strong>
+                <ol className="list-decimal list-inside space-y-1 pl-1">
+                  <li>
+                    Install Ollama (<code className="font-mono">https://ollama.com</code>) and pull
+                    your model:{' '}
+                    <code className="px-1.5 py-0.5 bg-white border rounded font-mono">
+                      ollama pull {runtimeConfig.modelTag}
+                    </code>{' '}
+                    (or <code className="font-mono">ollama pull gemma3:4b</code>).
+                  </li>
+                  <li>
+                    Start Ollama on localhost with browser CORS enabled (never expose port 11434 to
+                    the public internet):{' '}
+                    <code className="px-1.5 py-0.5 bg-white border rounded font-mono">
+                      OLLAMA_ORIGINS=http://localhost:3000,http://127.0.0.1:3000 ollama serve
+                    </code>
+                  </li>
+                  <li>
+                    Run SIET-LMS Offline locally on your machine:{' '}
+                    <code className="px-1.5 py-0.5 bg-white border rounded font-mono">
+                      npm install &amp;&amp; npm run dev
+                    </code>{' '}
+                    and open <code className="font-mono">http://localhost:3000</code>.
+                  </li>
+                  <li>
+                    Click <strong>Check Runtime &amp; Models</strong> and{' '}
+                    <strong>Test Model Inference</strong> above to verify a real model completion.
+                  </li>
+                </ol>
               </div>
             </div>
           </div>

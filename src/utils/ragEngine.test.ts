@@ -26,6 +26,7 @@ import {
 } from './documentParser';
 import {
   DEFAULT_GEMMA_CONFIG,
+  doesModelTagMatch,
   Gemma4LocalAdapter,
 } from '../services/gemmaAdapter';
 import { INITIAL_COURSES, INITIAL_DOCUMENTS, INITIAL_UPCOMING_EVENTS } from '../data/initialData';
@@ -239,7 +240,12 @@ test('Gemma4LocalAdapter handles empty questions, missing model runtime, runtime
   assert.equal(emptyRes.runtimeError, 'Question cannot be empty.');
   assert.equal(emptyRes.inferenceMode, 'local_extractive_rag_fallback');
 
-  // 2. Missing model on a reachable Ollama daemon
+  // 2. Exact model tag matching via doesModelTagMatch
+  assert.equal(doesModelTagMatch('gemma4:e4b', ['gemma4:e4b']), true);
+  assert.equal(doesModelTagMatch('gemma4', ['gemma4:latest']), true);
+  assert.equal(doesModelTagMatch('gemma4:e4b', ['gemma4:27b', 'llama3:8b']), false);
+
+  // 3. Missing model on a reachable Ollama daemon (model_tag_mismatch)
   const missingModelAdapter = new Gemma4LocalAdapter(async () => {
     return new Response(
       JSON.stringify({ models: [{ name: 'llama3:8b' }] }),
@@ -249,9 +255,34 @@ test('Gemma4LocalAdapter handles empty questions, missing model runtime, runtime
   const missingProbe = await missingModelAdapter.probeRuntime(DEFAULT_GEMMA_CONFIG);
   assert.equal(missingProbe.reachable, true);
   assert.equal(missingProbe.modelInstalled, false);
-  assert.ok(missingProbe.statusMessage.includes('is not installed'));
+  assert.equal(missingProbe.failureReason, 'model_tag_mismatch');
+  assert.ok(missingProbe.statusMessage.includes('does not match any installed model'));
 
-  // 3. Runtime HTTP 500 error during generation falls back gracefully to local document evidence
+  // 4. Empty models array on a reachable Ollama daemon (no_models_installed)
+  const zeroModelsAdapter = new Gemma4LocalAdapter(async () => {
+    return new Response(
+      JSON.stringify({ models: [] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  });
+  const zeroModelsProbe = await zeroModelsAdapter.probeRuntime(DEFAULT_GEMMA_CONFIG);
+  assert.equal(zeroModelsProbe.reachable, true);
+  assert.equal(zeroModelsProbe.modelInstalled, false);
+  assert.equal(zeroModelsProbe.failureReason, 'no_models_installed');
+
+  // 5. Non-JSON HTML 200 response (invalid_runtime_json)
+  const htmlFallbackAdapter = new Gemma4LocalAdapter(async () => {
+    return new Response('<!doctype html><html><body>SPA fallback</body></html>', {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    });
+  });
+  const htmlProbe = await htmlFallbackAdapter.probeRuntime(DEFAULT_GEMMA_CONFIG);
+  assert.equal(htmlProbe.reachable, false);
+  assert.equal(htmlProbe.modelInstalled, false);
+  assert.equal(htmlProbe.failureReason, 'invalid_runtime_json');
+
+  // 6. Runtime HTTP 500 error during generation falls back gracefully to local document evidence
   const errorAdapter = new Gemma4LocalAdapter(async () => {
     return new Response(
       JSON.stringify({ error: 'model runner crashed: out of VRAM' }),
@@ -268,7 +299,12 @@ test('Gemma4LocalAdapter handles empty questions, missing model runtime, runtime
   assert.ok(errorGen.runtimeError?.includes('out of VRAM'));
   assert.ok(errorGen.content.includes('Document Evidence'));
 
-  // 4. Mocked successful local Gemma 4 inference via Ollama
+  const failedVerify = await errorAdapter.verifyActualInference(DEFAULT_GEMMA_CONFIG);
+  assert.equal(failedVerify.verified, false);
+  assert.equal(failedVerify.rawResponseText, null);
+  assert.ok(failedVerify.errorMessage?.includes('out of VRAM'));
+
+  // 7. Mocked successful local Gemma 4 inference & verifyActualInference via Ollama
   const workingAdapter = new Gemma4LocalAdapter(async (input, init) => {
     const url = String(input);
     if (url.endsWith('/api/tags')) {
@@ -278,6 +314,12 @@ test('Gemma4LocalAdapter handles empty questions, missing model runtime, runtime
       );
     }
     const body = JSON.parse(String(init?.body ?? '{}'));
+    if (body.prompt === 'Reply with the single word READY.') {
+      return new Response(
+        JSON.stringify({ response: 'READY' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
     assert.ok(body.system.includes('<untrusted_course_reference_data>'));
     return new Response(
       JSON.stringify({
@@ -291,6 +333,10 @@ test('Gemma4LocalAdapter handles empty questions, missing model runtime, runtime
   const okProbe = await workingAdapter.probeRuntime(DEFAULT_GEMMA_CONFIG);
   assert.equal(okProbe.reachable, true);
   assert.equal(okProbe.modelInstalled, true);
+
+  const okVerify = await workingAdapter.verifyActualInference(DEFAULT_GEMMA_CONFIG);
+  assert.equal(okVerify.verified, true);
+  assert.equal(okVerify.rawResponseText, 'READY');
 
   const okGen = await workingAdapter.generateGroundedResponse({
     query: 'How are weak entities represented?',

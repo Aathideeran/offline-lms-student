@@ -140,6 +140,17 @@ export interface GemmaRuntimeConfig {
   maxTokens: number;
 }
 
+export type DiagnosticFailureReason =
+  | 'none'
+  | 'unprobed'
+  | 'https_preview_loopback_blocked'
+  | 'connection_refused_or_cors'
+  | 'http_error'
+  | 'invalid_runtime_json'
+  | 'no_models_installed'
+  | 'model_tag_mismatch'
+  | 'inference_error';
+
 export interface RuntimeProbeResult {
   reachable: boolean;
   modelInstalled?: boolean;
@@ -149,7 +160,23 @@ export interface RuntimeProbeResult {
   modelTag: string;
   latencyMs: number | null;
   statusMessage: string;
+  failureReason?: DiagnosticFailureReason;
+  executionOrigin?: string;
+  isHttpsCloudPreview?: boolean;
   checkedAt: string;
+}
+
+export interface InferenceVerificationResult {
+  verified: boolean;
+  backendId: RuntimeBackendId;
+  endpointUrl: string;
+  modelTag: string;
+  testPrompt: string;
+  rawResponseText: string | null;
+  latencyMs: number | null;
+  errorMessage?: string;
+  failureReason?: DiagnosticFailureReason;
+  verifiedAt: string;
 }
 
 export interface RetrievedCitation {
